@@ -7,16 +7,30 @@ import torch
 from torch.utils.data import Dataset
 from torch.nn.utils.rnn import pad_sequence
 
-def collate_fn(tokenizer, batch):
-    tokens, mask_idxs, keypoint_seqs, speaker_labels, task_labels = zip(*batch)
-    tokens = [torch.tensor(t) for t in tokens]
-    tokens = pad_sequence(tokens, batch_first=True, padding_value=tokenizer.pad_token_id).cuda()
-    mask_idxs = torch.tensor(mask_idxs).cuda()
-    task_labels = torch.tensor(task_labels).cuda()
-    keypoint_seqs = torch.tensor(np.array(keypoint_seqs)).cuda().float()
-    speaker_labels = torch.tensor(speaker_labels).cuda()
 
-    return tokens, mask_idxs, keypoint_seqs, speaker_labels, task_labels
+def collate_fn(tokenizer, batch):
+    """
+    batch elements:
+      (file_name, time_sec, tokens, mask_idx, keypoint_seq, speaker_label, task_label)
+    """
+    file_names, time_secs, tokens, mask_idxs, keypoint_seqs, speaker_labels, task_labels = zip(*batch)
+
+    # tokens: list[list[int]] -> padded tensor (B, L)
+    tokens = [torch.tensor(t, dtype=torch.long) for t in tokens]
+    tokens = pad_sequence(tokens, batch_first=True, padding_value=tokenizer.pad_token_id)
+
+    # scalars
+    time_secs = torch.tensor(time_secs, dtype=torch.long)
+    mask_idxs = torch.tensor(mask_idxs, dtype=torch.long)
+    task_labels = torch.tensor(task_labels, dtype=torch.long)
+    speaker_labels = torch.tensor(speaker_labels, dtype=torch.long)
+
+    # keypoints: list[np.ndarray] -> tensor (B, 6, 16, 34)
+    keypoint_seqs = torch.tensor(np.array(keypoint_seqs), dtype=torch.float32)
+
+    # file_names keep as list[str]
+    return list(file_names), time_secs, tokens, mask_idxs, keypoint_seqs, speaker_labels, task_labels
+
 
 class SocialDataset(Dataset):
     def __init__(self, args, is_training=True):
@@ -28,6 +42,8 @@ class SocialDataset(Dataset):
         self.meta_dir = args.meta_dir
         self.keypoint_dir = args.keypoint_dir
         self.task = args.task
+        self.txt_dir = args.txt_dir  # keep for file_name mapping
+        self.data_meta = []
 
         with open(args.data_split_file, 'r') as f:
             data_split = json.load(f)
@@ -42,6 +58,7 @@ class SocialDataset(Dataset):
             return '<mask>'
         else:
             raise ValueError(f"Unsupported language model: {language_model}")
+
     def get_file_names(self, args, data_split, is_training):
         data_type = 'train' if is_training else 'test'
         return [f"{args.txt_dir}/{file_name}.txt" for file_name in data_split[data_type]]
@@ -53,16 +70,16 @@ class SocialDataset(Dataset):
             reference_timestamps = json.load(f)
 
         for txt_file in txt_files:
-            file_name = txt_file.split('/')[-1].split('.txt')[0]
+            file_name = txt_file.split('/')[-1].split('.txt')[0]  # clip id
             txt_file_labeled = f"{self.txt_labeled_dir}/{file_name}.txt"
             keypoint_file = f"{self.keypoint_dir}/{file_name}.npy"
             meta_file = f"{self.meta_dir}/{file_name.split('_')[0]}.json"
 
             with open(txt_file, 'r') as f:
-                utterances = [utterance for utterance in f.read().split('\n') if utterance]
+                utterances = [u for u in f.read().split('\n') if u]
 
             with open(txt_file_labeled, 'r') as f:
-                utterances_labeled = [utterance_labeled for utterance_labeled in f.read().split('\n') if utterance_labeled]
+                utterances_labeled = [u for u in f.read().split('\n') if u]
 
             keypoint_data = np.load(keypoint_file, allow_pickle=True)
 
@@ -73,7 +90,12 @@ class SocialDataset(Dataset):
             reference_timestamp = reference_timestamps[file_name]
             keypoint_seq_ref = self.get_reference_keypoints(keypoint_data[reference_timestamp], player_num)
 
-            data_points.extend(self.process_utterances(utterances, utterances_labeled, keypoint_data, keypoint_seq_ref, player_num))
+            data_points.extend(
+                self.process_utterances(
+                    file_name, utterances, utterances_labeled,
+                    keypoint_data, keypoint_seq_ref, player_num
+                )
+            )
 
         return data_points
 
@@ -85,7 +107,7 @@ class SocialDataset(Dataset):
                 keypoint_seq_ref[keypoint_ref['idx'], :] = keypoint_wo_conf[:17 * 2]
         return keypoint_seq_ref
 
-    def process_utterances(self, utterances, utterances_labeled, keypoint_data, keypoint_seq_ref, player_num):
+    def process_utterances(self, file_name, utterances, utterances_labeled, keypoint_data, keypoint_seq_ref, player_num):
         data_points = []
 
         for utterance_i, (utterance, utterance_labeled) in enumerate(zip(utterances, utterances_labeled)):
@@ -102,13 +124,24 @@ class SocialDataset(Dataset):
 
             utterance_involved = False
             for word_i, word in enumerate(words):
-                data_point = self.process_word(word, word_i, utterance_labeled, words, player_num, is_player_speaker, utterance_involved)
+                data_point = self.process_word(
+                    word, word_i, utterance_labeled, words,
+                    player_num, is_player_speaker, utterance_involved
+                )
                 if data_point:
-                    keypoint_seq = self.get_keypoint_sequence(keypoint_data, time_sec, player_num, keypoint_seq_ref, speaker_label)
-                    convers_context = self.get_conversation_context(utterances, utterance_i, start_idx, end_idx, data_point[1])
+                    keypoint_seq = self.get_keypoint_sequence(
+                        keypoint_data, time_sec, player_num, keypoint_seq_ref, speaker_label
+                    )
+                    convers_context = self.get_conversation_context(
+                        utterances, utterance_i, start_idx, end_idx, data_point[1]
+                    )
                     masked_i = utterance_i - start_idx
-                    data_points.append((convers_context, masked_i, keypoint_seq, player_num, speaker_label, data_point[0]))
-                    utterance_involved = data_point[2] # To avoid same utterances are involved under STI task
+
+                    # IMPORTANT: prepend file_name and time_sec
+                    data_points.append(
+                        (file_name, time_sec, convers_context, masked_i, keypoint_seq, player_num, speaker_label, data_point[0])
+                    )
+                    utterance_involved = data_point[2]  # avoid duplicates in STI
 
         return data_points
 
@@ -136,7 +169,7 @@ class SocialDataset(Dataset):
                 ('Player' in utterance_labeled.split()[word_i]) and word_i != 0 and is_player_speaker:
             words_cp = copy.deepcopy(words)
             task_label = int(re.search(r'Player(\d+)', utterance_labeled.split()[word_i]).group(1))
-            target_pronoun = [pronoun for pronoun in third_pronouns if pronoun in word.lower()][-1]
+            target_pronoun = [p for p in third_pronouns if p in word.lower()][-1]
             words_cp[word_i] = re.sub(rf'{target_pronoun}', self.mask_token, words_cp[word_i].lower())
             return task_label, words_cp, utterance_involved
 
@@ -158,12 +191,12 @@ class SocialDataset(Dataset):
                     keypoint_wo_conf = np.delete(keypoint['keypoints'], np.arange(2, len(keypoint['keypoints']), 3))
                     keypoint_seq[keypoint['idx'], time_i, :] = keypoint_wo_conf[:17 * 2]
 
-            # Position correction for missing players
+            # position correction for missing players
             for player_i in range(player_num):
                 if np.sum(keypoint_seq[player_i, time_i, :]) == 0:
                     keypoint_seq[player_i, time_i, :] = keypoint_seq_ref[player_i]
 
-        # Normalize keypoints based on the speaker
+        # normalize keypoints based on the speaker
         zero_indices = np.where(keypoint_seq == 0)
         keypoint_seq = keypoint_seq - np.tile(keypoint_seq[speaker_label:speaker_label + 1][:, :, 0:2], (1, 1, 17))
         keypoint_seq[zero_indices] = 0
@@ -175,12 +208,11 @@ class SocialDataset(Dataset):
         utterances_cp = copy.deepcopy(utterances)
         utterances_cp[utterance_i] = target_utterance
         convers_context = utterances_cp[start_idx:end_idx]
-        convers_context = [re.sub(r' \(\d{2}:\d{2}\)', '', utterance) for utterance in convers_context]  # Remove timestamps
-
+        convers_context = [re.sub(r' \(\d{2}:\d{2}\)', '', u) for u in convers_context]
         return convers_context
 
     def apply_augmentation(self, convers_context, keypoint_seq, player_num, speaker_label, task_label):
-        # Flip keypoint
+        # flip keypoint
         if np.random.random() < 0.5:
             keypoint_seq[:, :, ::2] = -1.0 * keypoint_seq[:, :, ::2]
             keypoint_seq_cp = copy.deepcopy(keypoint_seq)
@@ -188,7 +220,7 @@ class SocialDataset(Dataset):
                 keypoint_seq[:, :, 2 * change_i:2 * change_i + 1] = keypoint_seq_cp[:, :, 2 * change_i + 1:2 * change_i + 2]
                 keypoint_seq[:, :, 2 * change_i + 1:2 * change_i + 2] = keypoint_seq_cp[:, :, 2 * change_i:2 * change_i + 1]
 
-        # Shuffle player numbers
+        # shuffle player numbers
         player_numbers = list(range(player_num))
         shuffled_player_numbers = copy.deepcopy(player_numbers)
         np.random.shuffle(shuffled_player_numbers)
@@ -197,8 +229,12 @@ class SocialDataset(Dataset):
         task_label = player_number_mapping[task_label]
         speaker_label = player_number_mapping[speaker_label]
 
-        convers_context = [re.sub(r'\[Player(\d+)\]', lambda match: '[Player{}]'.format(player_number_mapping[int(match.group(1))]),
-                   utterance) for utterance in convers_context]
+        convers_context = [
+            re.sub(r'\[Player(\d+)\]',
+                   lambda m: '[Player{}]'.format(player_number_mapping[int(m.group(1))]),
+                   u)
+            for u in convers_context
+        ]
 
         inverse_shuffle = np.argsort(shuffled_player_numbers + list(range(player_num, 6)))
         keypoint_seq = keypoint_seq[inverse_shuffle, :, :]
@@ -212,12 +248,15 @@ class SocialDataset(Dataset):
         while True:
             before_exists = masked_i - i - 1 >= 0
             after_exists = masked_i + i + 1 < len(convers_context)
+
             before_tokens = self.tokenizer.encode(convers_context[masked_i - i - 1], add_special_tokens=False) if before_exists else []
             after_tokens = self.tokenizer.encode(convers_context[masked_i + i + 1], add_special_tokens=False) if after_exists else []
-            if before_exists and len(tokens) + len(before_tokens) + 1 <= 511:  # add sentence before if available
+
+            if before_exists and len(tokens) + len(before_tokens) + 1 <= 511:
                 tokens = before_tokens + [self.tokenizer.sep_token_id] + tokens
-            if after_exists and len(tokens) + len(after_tokens) + 1 <= 511:  # add sentence after if available
+            if after_exists and len(tokens) + len(after_tokens) + 1 <= 511:
                 tokens = tokens + after_tokens + [self.tokenizer.sep_token_id]
+
             if not before_exists and not after_exists:
                 break
             i += 1
@@ -228,7 +267,7 @@ class SocialDataset(Dataset):
         return len(self.data_points)
 
     def __getitem__(self, idx):
-        convers_context, masked_i, keypoint_seq, player_num, speaker_label, task_label = self.data_points[idx]
+        file_name, time_sec, convers_context, masked_i, keypoint_seq, player_num, speaker_label, task_label = self.data_points[idx]
 
         if self.is_training:
             convers_context, keypoint_seq, speaker_label, task_label = \
@@ -237,5 +276,5 @@ class SocialDataset(Dataset):
         tokens = self.tokenize_conversation(convers_context, masked_i)
         mask_idx = tokens.index(self.tokenizer.mask_token_id)
 
-        return tokens, mask_idx, keypoint_seq, speaker_label, task_label
-
+        # IMPORTANT: return file_name + time_sec for temporal smoothing in test
+        return file_name, time_sec, tokens, mask_idx, keypoint_seq, speaker_label, task_label
