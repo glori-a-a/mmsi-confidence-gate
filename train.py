@@ -1,4 +1,3 @@
-# train.py
 import argparse
 import random
 from functools import partial
@@ -13,9 +12,6 @@ from model import MultimodalBaseline
 from utils import AverageMeter, Progbar
 
 
-# =====================
-# Reproducibility
-# =====================
 seed = 1234
 np.random.seed(seed)
 random.seed(seed)
@@ -24,24 +20,18 @@ torch.cuda.manual_seed(seed)
 torch.cuda.manual_seed_all(seed)
 
 
-# =====================
-# Args
-# =====================
 def parse_args():
     parser = argparse.ArgumentParser()
 
-    # basic
     parser.add_argument('--model_name', type=str, default='model_name')
     parser.add_argument('--task', type=str, default='STI', choices=['STI', 'PCR', 'MPP'])
 
-    # data paths
     parser.add_argument('--txt_dir', type=str, required=True)
     parser.add_argument('--txt_labeled_dir', type=str, required=True)
     parser.add_argument('--keypoint_dir', type=str, required=True)
     parser.add_argument('--meta_dir', type=str, required=True)
     parser.add_argument('--data_split_file', type=str, required=True)
 
-    # training
     parser.add_argument('--checkpoint_save_dir', type=str, default='./checkpoints')
     parser.add_argument('--language_model', type=str, default='bert',
                         choices=['bert', 'roberta', 'electra'])
@@ -53,16 +43,12 @@ def parse_args():
     parser.add_argument('--epochs_warmup', type=int, default=10)
     parser.add_argument('--workers', type=int, default=0)
 
-    # resume / save
     parser.add_argument('--resume', type=str, default='')
     parser.add_argument('--save_last', action='store_true')
 
     return parser.parse_args()
 
 
-# =====================
-# Tokenizer
-# =====================
 def get_tokenizer(language_model):
     if language_model == 'bert':
         from transformers import BertTokenizer
@@ -77,16 +63,13 @@ def get_tokenizer(language_model):
         raise ValueError(language_model)
 
 
-# =====================
-# Train / Eval
-# =====================
+
 def train_one_epoch(model, loader, optimizer, criterion,
                     scaler, device, use_amp, epoch, args):
     model.train()
     meter = AverageMeter()
     progbar = Progbar(len(loader.dataset))
 
-    # NEW: dataloader now returns 7 items
     for _, _, language_tokens, mask_idxs, keypoint_seqs, speaker_labels, task_labels in loader:
         language_tokens = language_tokens.to(device, non_blocking=True)
         mask_idxs = mask_idxs.to(device, non_blocking=True)
@@ -125,7 +108,6 @@ def evaluate(model, loader, device, epoch, args):
     model.eval()
     correct, total = 0, 0
 
-    # NEW: dataloader now returns 7 items
     for _, _, language_tokens, mask_idxs, keypoint_seqs, speaker_labels, task_labels in loader:
         language_tokens = language_tokens.to(device, non_blocking=True)
         mask_idxs = mask_idxs.to(device, non_blocking=True)
@@ -161,9 +143,6 @@ def save_checkpoint(path, args, model, optimizer, scaler,
     torch.save(ckpt, path)
 
 
-# =====================
-# Main
-# =====================
 def main():
     args = parse_args()
 
@@ -171,13 +150,11 @@ def main():
     use_amp = torch.cuda.is_available()
     os.makedirs(args.checkpoint_save_dir, exist_ok=True)
 
-    # model
     model = MultimodalBaseline(
         args.max_people_num,
         args.language_model
     ).to(device)
 
-    # optimizer
     language_params = [p for n, p in model.named_parameters()
                        if 'convers_encoder' in n]
     other_params = [p for n, p in model.named_parameters()
@@ -188,7 +165,6 @@ def main():
         {'params': language_params, 'lr': args.learning_rate},
     ])
 
-    # tokenizer + data
     tokenizer = get_tokenizer(args.language_model)
     args.tokenizer = tokenizer
     collate = partial(collate_fn, tokenizer)
@@ -221,7 +197,6 @@ def main():
     criterion = torch.nn.CrossEntropyLoss()
     scaler = torch.amp.GradScaler('cuda', enabled=use_amp)
 
-    # resume
     start_epoch = 0
     best_acc = 0.0
     best_epoch = 0

@@ -1,11 +1,3 @@
-# test.py (FULL REPLACEMENT)
-# Supports:
-# 1) multi-class baseline eval (original STI/PCR/MPP)
-# 2) binary smoother eval by selecting a target label K: P(y==K)
-#    - groups samples by file_name, sorts by time_sec, then runs smoother on the stream
-# 3) demo_smoother (synthetic) + JSON save
-# 4) safe JSON saving (numpy/torch -> python types)
-
 import argparse
 import os
 import json
@@ -15,16 +7,13 @@ from collections import defaultdict
 
 import numpy as np
 import torch
-from torch.utils.data import DataLoader
+from torch.utils.data import DataLoader, Dataset
 
 from dataloader import SocialDataset, collate_fn
 from model import MultimodalBaseline
 from modules.confidence_gate import TTMStateSmoother, TTMConfig
 
 
-# -----------------------
-# Reproducibility
-# -----------------------
 seed = 1234
 np.random.seed(seed)
 random.seed(seed)
@@ -34,9 +23,6 @@ if torch.cuda.is_available():
     torch.cuda.manual_seed_all(seed)
 
 
-# -----------------------
-# Helpers
-# -----------------------
 def get_tokenizer(language_model):
     if language_model == "bert":
         from transformers import BertTokenizer
@@ -81,13 +67,59 @@ def sanity_required_paths(args):
         "checkpoint_file": args.checkpoint_file,
     }
     for k, v in required.items():
-        if v == "enter_the_path":
-            raise FileNotFoundError(f"Argument --{k} is still 'enter_the_path'. Please pass the real path.")
+        if v in ["enter_the_path", "..."]:
+            raise FileNotFoundError(
+                f"Argument --{k} is still placeholder ('{v}'). Please pass the real path."
+            )
 
 
-# -----------------------
-# CLI
-# -----------------------
+class SocialDatasetWithMeta(Dataset):
+    """
+    Wraps SocialDataset and returns:
+      (file_name, time_sec, tokens, mask_idx, keypoint_seq, speaker_label, task_label)
+    We fetch file_name/time_sec from SocialDataset.data_points which is built in __init__.
+    """
+
+    def __init__(self, base_dataset: SocialDataset):
+        self.base = base_dataset
+        self.has_meta = hasattr(base_dataset, "data_meta")
+
+    def __len__(self):
+        return len(self.base)
+
+    def __getitem__(self, idx):
+        tokens, mask_idx, keypoint_seq, speaker_label, task_label = self.base[idx]
+
+        if self.has_meta:           
+            meta = self.base.data_meta[idx]
+            file_name = meta.get("file_name", "unknown")
+            time_sec = int(meta.get("time_sec", idx))
+        else:
+            file_name = "unknown"
+            time_sec = int(idx)
+
+        return file_name, time_sec, tokens, mask_idx, keypoint_seq, speaker_label, task_label
+
+
+def collate_with_meta(tokenizer, batch):
+    """
+    batch item:
+      (file_name, time_sec, tokens, mask_idx, keypoint_seq, speaker_label, task_label)
+
+    Returns:
+      file_names (list[str]),
+      time_secs (list[int]),
+      tokens (B,L),
+      mask_idxs (B,),
+      keypoint_seqs (B,6,16,34),
+      speaker_labels (B,),
+      task_labels (B,)
+    """
+    file_names, time_secs, tokens, mask_idxs, keypoint_seqs, speaker_labels, task_labels = zip(*batch)
+    tokens, mask_idxs, keypoint_seqs, speaker_labels, task_labels = collate_fn(tokenizer, list(zip(tokens, mask_idxs, keypoint_seqs, speaker_labels, task_labels)))
+    return list(file_names), list(time_secs), tokens, mask_idxs, keypoint_seqs, speaker_labels, task_labels
+
+
 def parse_args():
     parser = argparse.ArgumentParser()
 
@@ -116,7 +148,7 @@ def parse_args():
     parser.add_argument("--theta_on", type=float, default=0.65)
     parser.add_argument("--theta_off", type=float, default=0.35)
 
-    # IMPORTANT: make multi-class -> binary stream by choosing a target label K
+    # multi-class -> binary by choosing K
     parser.add_argument("--binary_target_label", type=int, default=-1,
                         help="If >=0, convert multi-class logits to prob stream p_t=P(y==K) and gt_t=(label==K). "
                              "This enables the binary smoother on STI(6-class).")
@@ -132,9 +164,6 @@ def parse_args():
     return parser.parse_args()
 
 
-# -----------------------
-# Demo smoother (synthetic)
-# -----------------------
 def run_smoother_demo(cfg: TTMConfig):
     smoother = TTMStateSmoother(cfg)
 
@@ -154,16 +183,12 @@ def run_smoother_demo(cfg: TTMConfig):
     }
 
 
-# -----------------------
-# Eval: multi-class baseline accuracy (original)
-# -----------------------
 @torch.no_grad()
 def eval_multiclass_baseline(model, loader, device):
     model.eval()
     correct = 0
     total = 0
 
-    # NEW dataloader returns: file_names, time_secs, tokens, mask_idxs, keypoint_seqs, speaker_labels, task_labels
     for _, _, tokens, mask_idxs, keypoint_seqs, speaker_labels, task_labels in loader:
         tokens = tokens.to(device, non_blocking=True)
         mask_idxs = mask_idxs.to(device, non_blocking=True)
@@ -180,23 +205,12 @@ def eval_multiclass_baseline(model, loader, device):
     return correct / max(total, 1), int(total)
 
 
-# -----------------------
-# Eval: binary stream + smoother by grouping sequences (REAL data)
-# -----------------------
 @torch.no_grad()
 def eval_binary_with_optional_smoother(model, loader, device, target_k: int,
                                       use_smoother: bool, cfg: TTMConfig):
-    """
-    Build per-file temporal streams:
-      p_t = P(y==target_k)
-      gt_t = 1[label==target_k] else 0
-    Sort by time_sec inside each file, run smoother on the whole stream.
-    Returns:
-      baseline_acc_binary, smoother_acc_binary, and some stats + optionally per-file results.
-    """
     model.eval()
 
-    # collect per-file list of (time, prob, gt)
+   
     streams = defaultdict(list)
 
     for file_names, time_secs, tokens, mask_idxs, keypoint_seqs, speaker_labels, task_labels in loader:
@@ -206,15 +220,15 @@ def eval_binary_with_optional_smoother(model, loader, device, target_k: int,
         speaker_labels = speaker_labels.to(device, non_blocking=True)
 
         logits = model(tokens, mask_idxs, keypoint_seqs, speaker_labels, warmup=False)
-        probs = torch.softmax(logits, dim=1)  # (B,C)
+        probs = torch.softmax(logits, dim=1)  
 
-        prob_k = probs[:, target_k].detach().cpu().numpy()  # (B,)
-        gt = (task_labels.numpy() == target_k).astype(np.int64)  # (B,)
-        # file_names/time_secs are from collate_fn; keep as python lists
+        prob_k = probs[:, target_k].detach().cpu().numpy()  
+        gt = (task_labels.numpy() == target_k).astype(np.int64) 
+
         for fn, ts, pk, g in zip(list(file_names), list(time_secs), prob_k.tolist(), gt.tolist()):
             streams[fn].append((int(ts), float(pk), int(g)))
 
-    # baseline binary decision on prob_k
+    
     base_correct = 0
     base_total = 0
 
@@ -231,15 +245,13 @@ def eval_binary_with_optional_smoother(model, loader, device, target_k: int,
         p = np.array([x[1] for x in items_sorted], dtype=np.float32)
         y = np.array([x[2] for x in items_sorted], dtype=np.int64)
 
-        # baseline: threshold 0.5
         y_base = (p >= 0.5).astype(np.int64)
 
         base_correct += int((y_base == y).sum())
         base_total += int(len(y))
 
-        y_smooth = None
         if smoother is not None:
-            out = smoother.run(p, reset=True)  # reset per file
+            out = smoother.run(p, reset=True)  
             y_smooth = np.array(out["y_hat"], dtype=np.int64)
 
             smooth_correct += int((y_smooth == y).sum())
@@ -278,10 +290,6 @@ def eval_binary_with_optional_smoother(model, loader, device, target_k: int,
 
     return stats, per_file
 
-
-# -----------------------
-# Main
-# -----------------------
 def main():
     args = parse_args()
 
@@ -313,9 +321,13 @@ def main():
 
     tokenizer = get_tokenizer(args.language_model)
     args.tokenizer = tokenizer
-    collate_fn_token = partial(collate_fn, tokenizer)
 
-    test_dataset = SocialDataset(args, is_training=False)
+    # base dataset + wrapper with meta
+    base_test_dataset = SocialDataset(args, is_training=False)
+    test_dataset = SocialDatasetWithMeta(base_test_dataset)
+
+    collate_fn_token = partial(collate_with_meta, tokenizer)
+
     test_loader = DataLoader(
         test_dataset,
         batch_size=args.batch_size,
@@ -331,7 +343,7 @@ def main():
     print()
     print(f"[Multi-class baseline] acc={acc_mc:.3f} (N={n_mc})")
 
-    # 2) optional binary + smoother (REAL data)
+    # 2) optional binary + smoother
     binary_stats = None
     per_file = None
     if args.use_ttm_smoother:
@@ -352,6 +364,11 @@ def main():
             print(f"[Binary target K={args.binary_target_label}] baseline_acc={binary_stats['baseline_binary_acc']:.3f}")
             print(f"[Binary target K={args.binary_target_label}] smoother_acc={binary_stats['smoother_binary_acc']:.3f}")
             print(f"Smoother cfg: alpha={args.alpha}, tau={args.tau}, theta_on={args.theta_on}, theta_off={args.theta_off}")
+
+            if "unknown" in per_file:
+                print()
+                print("[NOTE] file_name/time_sec meta not found in dataset (all grouped under 'unknown').")
+                print("       For REAL temporal smoothing, add dataset.data_meta in dataloader.py (2 lines).")
 
     print(f"Device: {device}")
     print(f"Model: {args.model_name}")
@@ -377,7 +394,6 @@ def main():
             },
         }
 
-        # per_file can be big; still useful for debugging. Keep it.
         if per_file is not None:
             payload["per_file_streams"] = per_file
 

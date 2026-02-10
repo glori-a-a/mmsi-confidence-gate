@@ -6,6 +6,7 @@ from modules.gaze import GazeEncoder
 from modules.gesture import GestureEncoder
 
 
+
 class Permute(nn.Module):
     def __init__(self, *dims):
         super().__init__()
@@ -22,21 +23,20 @@ class PositionalEncoding(nn.Module):
     """
     def __init__(self, d_model: int, max_len: int = 20):
         super().__init__()
-        pe = torch.zeros(max_len, d_model)  # (max_len, d_model)
+        pe = torch.zeros(max_len, d_model)  
 
-        position = torch.arange(0, max_len, dtype=torch.float).unsqueeze(1)  # (max_len, 1)
+        position = torch.arange(0, max_len, dtype=torch.float).unsqueeze(1)  
         div_term = torch.exp(torch.arange(0, d_model, 2, dtype=torch.float) *
-                             (-math.log(10000.0) / d_model))  # (d_model/2,)
+                             (-math.log(10000.0) / d_model)) 
 
-        pe[:, 0::2] = torch.sin(position * div_term)  # even
-        pe[:, 1::2] = torch.cos(position * div_term)  # odd
+        pe[:, 0::2] = torch.sin(position * div_term)  
+        pe[:, 1::2] = torch.cos(position * div_term)  
 
-        self.register_buffer("encoding", pe)  # (max_len, d_model)
+        self.register_buffer("encoding", pe)  
 
     def forward(self, x: torch.Tensor):
-        # x: (seq_len, batch, d_model)
         seq_len = x.size(0)
-        return x + self.encoding[:seq_len, :].unsqueeze(1)  # (seq_len,1,d_model)
+        return x + self.encoding[:seq_len, :].unsqueeze(1) 
 
 
 class MultimodalBaseline(nn.Module):
@@ -115,7 +115,7 @@ class MultimodalBaseline(nn.Module):
         self.positional_enc = PositionalEncoding(d_model=512, max_len=50)  # 稍微大一点更安全
         self.cls_token = nn.Parameter(torch.randn(1, 1, 512))
 
-        # ✅ 新增：gaze/gesture 作为额外 token
+        
         # speaker_feature_raw shape: (B, 16, 9*64) => in_dim = 9*64
         self.gaze_token_enc = GazeEncoder(in_dim=9 * 64, out_dim=512)
         self.gesture_token_enc = GestureEncoder(in_dim=9 * 64, out_dim=512)
@@ -148,9 +148,7 @@ class MultimodalBaseline(nn.Module):
         speaker_feature = speaker_feature.view(batch_size, 16, -1, 2)  # (B,16,9,2)
         speaker_feature_raw = self.coordinate_fc(speaker_feature).view(batch_size, 16, -1)  # (B,16,9*64)
 
-        # ✅ 新增 token：从 speaker_feature_raw 提取 gaze/gesture summary token
-       # ---- make (1,B,512) tokens ----
-# pool over time dimension (16)
+        
         speaker_pool = speaker_feature_raw.mean(dim=1)            # (B,576)
 
         gaze_vec = self.gaze_token_enc(speaker_pool)             # (B,512)
@@ -158,9 +156,9 @@ class MultimodalBaseline(nn.Module):
 
         gaze_token = gaze_vec.unsqueeze(0)                       # (1,B,512)
         gesture_token = gesture_vec.unsqueeze(0)                 # (1,B,512)
-# --------------------------------
 
-        # 原 speaker encoder -> (T',B,512)
+
+        
         speaker_feature = self.speaker_encoder(speaker_feature_raw).permute(1, 0, 2)  # (16,B,512)
 
         # encode listener positions

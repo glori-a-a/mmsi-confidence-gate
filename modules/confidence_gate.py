@@ -1,79 +1,93 @@
 from dataclasses import dataclass
-from typing import Iterable, List, Optional
-
+import torch
+import torch.nn.functional as F
 import numpy as np
 
-
-@dataclass
-class TTMConfig:
-    alpha: float = 0.2      # EMA update speed
-    tau: float = 0.15       # confidence threshold
-    theta_on: float = 0.65  # hysteresis high threshold
-    theta_off: float = 0.35 # hysteresis low threshold
-    init_m: float = 0.5     # initial state
-    init_y: int = 0         # initial decision 0/1
-
-    def __post_init__(self):
-        assert 0.0 <= self.init_m <= 1.0
-        assert 0.0 <= self.theta_off < self.theta_on <= 1.0
-        assert 0.0 <= self.tau <= 0.5
-        assert 0.0 < self.alpha <= 1.0
-
-
-class TTMStateSmoother:
+class MultiClassConfidenceGate:
     """
-    Confidence-gated state update + hysteresis decision.
-    Input: per-frame probabilities p_t in [0,1].
-    Output: smoothed binary decisions y_hat_t in {0,1}, plus state m_t.
+    Multi-class confidence-gated EMA smoothing.
+    - Maintain state m_t over C classes.
+    - Update only when top1-top2 margin >= tau.
     """
-
-    def __init__(self, cfg: Optional[TTMConfig] = None):
-        self.cfg = cfg or TTMConfig()
+    def __init__(self, num_classes, alpha=0.2, tau=0.12):
+        self.C = num_classes
+        self.alpha = float(alpha)
+        self.tau = float(tau)
         self.reset()
 
     def reset(self):
-        self.m = float(self.cfg.init_m)
-        self.y = int(self.cfg.init_y)
+        self.m = np.ones(self.C, dtype=np.float32) / self.C
 
-    @staticmethod
-    def confidence(p: float) -> float:
-        return abs(p - 0.5)
+    def step(self, p_vec):
+        p = np.asarray(p_vec, dtype=np.float32)
+        # confidence = margin between top1 and top2
+        top2 = np.partition(p, -2)[-2:]
+        conf = float(top2[-1] - top2[-2])
 
-    def step(self, p: float) -> int:
-        # clamp p
-        p = float(np.clip(p, 0.0, 1.0))
-        c = self.confidence(p)
+        if conf >= self.tau:
+            self.m = (1.0 - self.alpha) * self.m + self.alpha * p
+        # else: keep m
 
-        # gated EMA update
-        if c >= self.cfg.tau:
-            self.m = (1.0 - self.cfg.alpha) * self.m + self.cfg.alpha * p
-        # else: keep m unchanged
+        y_hat = int(np.argmax(self.m))
+        return y_hat, conf, self.m.copy()
 
-        # hysteresis decision
-        if self.m >= self.cfg.theta_on:
-            self.y = 1
-        elif self.m <= self.cfg.theta_off:
-            self.y = 0
-        # else: keep y unchanged
+@dataclass
+class GateConfig:
+    alpha: float = 0.2          
+    tau: float = 0.15           # confidence threshold
+    use_hysteresis: bool = False
+    margin_on: float = 0.20     # optional: for hysteresis on
+    margin_off: float = 0.10    # optional: for hysteresis off
 
-        return self.y
+class CategoricalStateSmoother:
+    """
+    Confidence-gated EMA smoothing for multi-class predictions.
 
-    def run(self, probs: Iterable[float], reset: bool = True) -> dict:
-        if reset:
-            self.reset()
+    Given logits_t (B,C), compute probs p_t.
+    confidence c_t = p_max - p_second (margin).
+    If c_t >= tau: m_t = (1-alpha) m_{t-1} + alpha p_t
+    else:          m_t = m_{t-1}
 
-        ys: List[int] = []
-        ms: List[float] = []
-        cs: List[float] = []
+    Output: smoothed probs m_t and smoothed prediction argmax(m_t).
+    """
+    def __init__(self, num_classes: int, cfg: GateConfig, device=None):
+        self.C = num_classes
+        self.cfg = cfg
+        self.device = device
+        self.reset()
 
-        for p in probs:
-            p = float(np.clip(p, 0.0, 1.0))
-            cs.append(self.confidence(p))
-            ys.append(self.step(p))
-            ms.append(self.m)
+    def reset(self):
+        self.m = None  
 
-        return {
-            "y_hat": np.array(ys, dtype=np.int64),
-            "m": np.array(ms, dtype=np.float32),
-            "c": np.array(cs, dtype=np.float32),
-        }
+    @torch.no_grad()
+    def step(self, logits: torch.Tensor):
+        """
+        logits: (B,C)
+        returns:
+          m: (B,C) smoothed probs
+          pred: (B,) argmax(m)
+          conf: (B,) margin confidence
+          updated: (B,) bool
+        """
+        probs = F.softmax(logits, dim=-1)  # (B,C)
+        B, C = probs.shape
+        assert C == self.C
+
+        # margin confidence: top1 - top2
+        top2 = torch.topk(probs, k=2, dim=-1).values  
+        conf = top2[:, 0] - top2[:, 1]              
+
+        if self.m is None:
+            # init state as uniform (or first probs). Uniform is safer if you want "no bias".
+            self.m = torch.full_like(probs, 1.0 / C)
+            if self.device is not None:
+                self.m = self.m.to(self.device)
+
+        gate = (conf >= self.cfg.tau).float().unsqueeze(-1)  
+
+        # EMA update only when gate=1
+        self.m = (1.0 - self.cfg.alpha * gate) * self.m + (self.cfg.alpha * gate) * probs
+
+        pred = torch.argmax(self.m, dim=-1)  
+        updated = (gate.squeeze(-1) > 0.0)
+        return self.m, pred, conf, updated
