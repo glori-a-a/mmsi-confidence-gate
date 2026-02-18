@@ -27,3 +27,12 @@ dataloader.py.bak*
 
 # Misc
 .DS_Store
+
+# Local experiment folders
+Werewolf-Among-Us/
+runs/gate_train_sweep/
+runs/gate_train_sweep_fast/
+runs/gate_train_sweep_quick/
+runs/smoother_demo/
+runs/sti_test/logs/test_gate_K*.log
+runs/sti_test/results/gate_K*.json
