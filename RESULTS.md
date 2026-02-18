@@ -1,7 +1,6 @@
 # Experiment Summary (STI)
 
 ## Setup
-- Clean setting: removed label leakage tokens from input text.
 - Dataset split: train/test no overlap.
 - Metric: multi-class accuracy on test set (N=821).
 - Stability metric: switch-rate (prediction transition rate across time).
