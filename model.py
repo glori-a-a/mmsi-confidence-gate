@@ -40,11 +40,12 @@ class PositionalEncoding(nn.Module):
 
 
 class MultimodalBaseline(nn.Module):
-    def __init__(self, class_num, language_model):
+    def __init__(self, class_num, language_model, use_film_fusion=False):
         super(MultimodalBaseline, self).__init__()
 
         self.class_num = class_num
         self.language_model = language_model
+        self.use_film_fusion = bool(use_film_fusion)
 
         if language_model == 'bert':
             from transformers import BertModel
@@ -122,6 +123,26 @@ class MultimodalBaseline(nn.Module):
 
         self.classifier = nn.Sequential(nn.Linear(512, class_num))
 
+        if self.use_film_fusion:
+            # FiLM generator: language feature -> (gamma, beta) for 512-d visual tokens.
+            self.film_generator = nn.Sequential(
+                nn.Linear(512, 512),
+                nn.ReLU(),
+                nn.Linear(512, 1024)
+            )
+
+    def _apply_film(self, x, cond_vec):
+        """
+        x: (S, B, D), cond_vec: (B, D)
+        FiLM(x) = gamma(cond) * x + beta(cond)
+        """
+        if not self.use_film_fusion:
+            return x
+        gb = self.film_generator(cond_vec)  # (B, 2D)
+        gamma, beta = torch.chunk(gb, chunks=2, dim=-1)
+        gamma = 1.0 + gamma
+        return gamma.unsqueeze(0) * x + beta.unsqueeze(0)
+
     def forward(self, language_token, mask_idxs, keypoint_seqs, speaker_labels, warmup=False):
         # encode language conversation
         pad_val = 0 if self.language_model in ['bert', 'electra'] else 1
@@ -177,6 +198,11 @@ class MultimodalBaseline(nn.Module):
             [position_feature, self.positional_enc(speaker_feature[::2, :, :])],
             dim=0
         )  # (1+8,B,512) if speaker_feature is 16 -> [::2] gives 8
+
+        if self.use_film_fusion:
+            # FiLM condition is the language embedding; modulate visual tokens.
+            film_cond = convers_feature.squeeze(0)  # (B,512)
+            vis_feature = self._apply_film(vis_feature, film_cond)
 
         vis_feature = self.visual_trans(vis_feature)
         vis_feature = self.positional_enc(vis_feature)

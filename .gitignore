@@ -1,0 +1,29 @@
+# Python cache
+__pycache__/
+*.pyc
+
+# Large checkpoints
+checkpoints*/
+runs/**/checkpoints/
+*.pt
+*.pth
+
+# Conda / env
+.env
+.venv
+
+# Experiment artifacts
+runs/**/logs/
+runs/**/results/
+runs/**/results_*.json
+runs/**/summary.csv
+
+# Local backups
+*.bak
+*.bad_*
+test.py.bak*
+model.py.bak*
+dataloader.py.bak*
+
+# Misc
+.DS_Store

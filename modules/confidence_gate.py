@@ -16,10 +16,19 @@ class MultiClassConfidenceGate:
         self.reset()
 
     def reset(self):
-        self.m = np.ones(self.C, dtype=np.float32) / self.C
+        # Lazy init from first observed probability vector.
+        # Uniform init can bias argmax to class 0 when confidence is low.
+        self.m = None
 
     def step(self, p_vec):
         p = np.asarray(p_vec, dtype=np.float32)
+        if self.m is None:
+            self.m = p.copy()
+            top2 = np.partition(p, -2)[-2:]
+            conf = float(top2[-1] - top2[-2])
+            y_hat = int(np.argmax(self.m))
+            return y_hat, conf, self.m.copy()
+
         # confidence = margin between top1 and top2
         top2 = np.partition(p, -2)[-2:]
         conf = float(top2[-1] - top2[-2])
@@ -78,8 +87,8 @@ class CategoricalStateSmoother:
         conf = top2[:, 0] - top2[:, 1]              
 
         if self.m is None:
-            # init state as uniform (or first probs). Uniform is safer if you want "no bias".
-            self.m = torch.full_like(probs, 1.0 / C)
+            # Init state from first observed probs to avoid class-0 tie bias.
+            self.m = probs.clone()
             if self.device is not None:
                 self.m = self.m.to(self.device)
 
