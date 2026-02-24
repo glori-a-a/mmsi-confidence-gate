@@ -82,6 +82,30 @@ def parse_args():
     parser.add_argument("--language_model", type=str, default="bert", choices=["bert", "roberta", "electra"])
     parser.add_argument("--use_film_fusion", action="store_true",
                         help="Enable FiLM-conditioned visual fusion (must match training).")
+    parser.add_argument("--film_vision_layers", type=int, default=0,
+                        help="FiLM layers on vision branch (used for old checkpoints without saved model_kwargs).")
+    parser.add_argument("--film_fusion_layers", type=int, default=0,
+                        help="FiLM layers on fusion branch (used for old checkpoints without saved model_kwargs).")
+    parser.add_argument("--film_hidden_dim", type=int, default=512,
+                        help="FiLM hidden size (used for old checkpoints without saved model_kwargs).")
+    parser.add_argument("--enable_gradcam", action="store_true",
+                        help="Enable Grad-CAM hooks during evaluation (for custom analyses).")
+    parser.add_argument("--gradcam_target", type=str, default="vision_post_transformer",
+                        choices=["vision_pre_transformer", "vision_post_transformer", "fusion_output"],
+                        help="Internal tensor used for Grad-CAM if hooks are enabled.")
+    parser.add_argument("--export_gradcam", action="store_true",
+                        help="Export token-level Grad-CAM values to JSON.")
+    parser.add_argument("--gradcam_export_path", type=str, default="",
+                        help="Where to save Grad-CAM JSON (required if --export_gradcam).")
+    parser.add_argument("--gradcam_label_source", type=str, default="pred",
+                        choices=["pred", "gt"],
+                        help="Use predicted labels or ground-truth labels as Grad-CAM targets.")
+    parser.add_argument("--gradcam_export_max_batches", type=int, default=-1,
+                        help="If >0, only export the first N batches for Grad-CAM.")
+    parser.add_argument("--gradcam_export_max_samples", type=int, default=-1,
+                        help="If >0, cap exported Grad-CAM samples.")
+    parser.add_argument("--export_gradcam_only", action="store_true",
+                        help="Export Grad-CAM and exit early without running the rest of evaluation.")
     parser.add_argument("--max_people_num", type=int, default=6)
     parser.add_argument("--context_length", type=int, default=5)
     parser.add_argument("--batch_size", type=int, default=16)
@@ -212,6 +236,89 @@ def parse_int_list(csv_text: str):
     if not vals:
         raise ValueError(f"Empty int list from: '{csv_text}'")
     return vals
+
+
+def export_gradcam_tokens(model, loader, device, args):
+    if not args.export_gradcam:
+        return None
+    if not args.gradcam_export_path:
+        raise ValueError("--export_gradcam requires --gradcam_export_path")
+
+    if not hasattr(model, "set_gradcam"):
+        raise RuntimeError("Model does not support Grad-CAM hooks.")
+
+    model.eval()
+    model.set_gradcam(enabled=True, target_name=args.gradcam_target)
+
+    rows = []
+    total = 0
+    max_batches = args.gradcam_export_max_batches
+    max_samples = args.gradcam_export_max_samples
+
+    with torch.enable_grad():
+        for batch_idx, (file_names, time_secs, tokens, mask_idxs, keypoint_seqs, speaker_labels, task_labels) in enumerate(loader):
+            if max_batches > 0 and batch_idx >= max_batches:
+                break
+
+            tokens = tokens.to(device, non_blocking=True)
+            mask_idxs = mask_idxs.to(device, non_blocking=True)
+            keypoint_seqs = keypoint_seqs.to(device, non_blocking=True)
+            speaker_labels = speaker_labels.to(device, non_blocking=True)
+            task_labels_dev = task_labels.to(device, non_blocking=True)
+
+            logits = model(tokens, mask_idxs, keypoint_seqs, speaker_labels, warmup=False)
+            pred = torch.argmax(logits, dim=1)
+            target = pred if args.gradcam_label_source == "pred" else task_labels_dev
+
+            cam = model.compute_gradcam_from_logits(
+                logits=logits,
+                target_labels=target,
+                name=args.gradcam_target,
+                retain_graph=False,
+                create_graph=False,
+            )
+            if cam is None:
+                continue
+
+            probs = torch.softmax(logits.detach(), dim=1)
+            cam_cpu = cam.detach().cpu()
+            pred_cpu = pred.detach().cpu()
+            probs_cpu = probs.detach().cpu()
+
+            for i in range(cam_cpu.size(0)):
+                rows.append({
+                    "file_name": str(file_names[i]),
+                    "time_sec": int(time_secs[i]),
+                    "speaker_label": int(speaker_labels[i].detach().cpu().item()),
+                    "gt_label": int(task_labels[i].item()),
+                    "pred_label": int(pred_cpu[i].item()),
+                    "target_label_for_cam": int(target[i].detach().cpu().item()),
+                    "gradcam_target": args.gradcam_target,
+                    "cam_tokens": cam_cpu[i].tolist(),
+                    "probs": probs_cpu[i].tolist(),
+                })
+                total += 1
+                if max_samples > 0 and total >= max_samples:
+                    break
+
+            if max_samples > 0 and total >= max_samples:
+                break
+
+    payload = {
+        "meta": {
+            "gradcam_target": args.gradcam_target,
+            "label_source": args.gradcam_label_source,
+            "num_samples": len(rows),
+            "max_batches": max_batches,
+            "max_samples": max_samples,
+        },
+        "samples": rows,
+    }
+    ensure_dir_for_file(args.gradcam_export_path)
+    with open(args.gradcam_export_path, "w") as f:
+        json.dump(to_jsonable(payload), f, indent=2)
+    print(f"[Grad-CAM] saved {len(rows)} samples to: {args.gradcam_export_path}")
+    return payload
 
 
 @torch.no_grad()
@@ -522,15 +629,37 @@ def main():
 
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
-    model = MultimodalBaseline(
-        args.max_people_num,
-        args.language_model,
-        use_film_fusion=args.use_film_fusion
-    ).to(device)
-
     ckpt = torch.load(args.checkpoint_file, map_location=device)
+    ckpt_model_kwargs = ckpt.get("model_kwargs") if isinstance(ckpt, dict) else None
+    if ckpt_model_kwargs:
+        model_kwargs = dict(ckpt_model_kwargs)
+    else:
+        model_kwargs = dict(
+            class_num=args.max_people_num,
+            language_model=args.language_model,
+            use_film_fusion=args.use_film_fusion,
+            film_vision_layers=args.film_vision_layers,
+            film_fusion_layers=args.film_fusion_layers,
+            film_hidden_dim=args.film_hidden_dim,
+            enable_gradcam=args.enable_gradcam,
+        )
+    # CLI can still force Grad-CAM hooks without changing checkpoint structure.
+    if args.enable_gradcam:
+        model_kwargs["enable_gradcam"] = True
+
+    model = MultimodalBaseline(**model_kwargs).to(device)
+    if hasattr(model, "set_gradcam"):
+        model.set_gradcam(enabled=args.enable_gradcam, target_name=args.gradcam_target)
+
     state_dict = ckpt["model"] if isinstance(ckpt, dict) and "model" in ckpt else ckpt
-    model.load_state_dict(state_dict)
+    strict = ckpt_model_kwargs is None and not (
+        args.use_film_fusion or args.film_vision_layers > 0 or args.film_fusion_layers > 0
+    )
+    if strict:
+        model.load_state_dict(state_dict)
+    else:
+        missing, unexpected = model.load_state_dict(state_dict, strict=False)
+        print(f"[LOAD] strict=False | missing={len(missing)} unexpected={len(unexpected)}")
     print(f"[OK] Loaded checkpoint: {args.checkpoint_file}")
 
     tokenizer = get_tokenizer(args.language_model)
@@ -547,6 +676,12 @@ def main():
         drop_last=False,
         pin_memory=torch.cuda.is_available(),
     )
+
+    if args.export_gradcam:
+        export_gradcam_tokens(model, test_loader, device, args)
+        if args.export_gradcam_only:
+            print("[Grad-CAM] export_gradcam_only=True, skip remaining evaluation.")
+            return
 
     # 1) multi-class baseline
     acc_mc, n_mc = eval_multiclass_baseline(model, test_loader, device)
